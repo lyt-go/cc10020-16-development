@@ -3,4 +3,6 @@ from __future__ import annotations
 
 from app.routers import resource, pipeline
 
-ROUTERS = [resource, pipeline]
+# pipeline 是固定前缀的跨模块链路，必须先于 /api/{module} 动态资源路由注册，
+# 否则 /api/pipeline/health-summary 这类 GET 会被当成 entry_id 解析。
+ROUTERS = [pipeline, resource]

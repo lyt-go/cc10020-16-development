@@ -96,3 +96,18 @@ def run_action(module: str, entry_id: int, payload: ActionPayload) -> ActionResu
     service = require_service(module)
     entry, message = service.run_action(entry_id, payload.action.strip())
     return ActionResult(ok=entry is not None, message=message, entry=entry)
+
+
+@router.get("/{module}/{entry_id}/detail", response_model=dict)
+def get_entry_detail(module: str, entry_id: int, request: Request) -> dict[str, Any]:
+    """模块详情扩展：结构归属明细按查看通道返回只读/可使用结论。"""
+    service = require_service(module)
+    viewer = request.query_params.get("channel_id")
+    viewer_id = int(viewer) if viewer and viewer.isdigit() else None
+    if module == "event_schema_ownership":
+        detail = service.get_ownership_detail(entry_id, viewer_id)  # type: ignore[attr-defined]
+    else:
+        detail = service.get_entry(entry_id)
+    if detail is None:
+        raise HTTPException(status_code=404, detail=f"{service.ENTITY} {entry_id} 不存在或已归档")
+    return detail

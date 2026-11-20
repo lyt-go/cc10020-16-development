@@ -20,6 +20,9 @@ from app.services.incre_cursor import IncreCursorService
 from app.services.backfill_job import BackfillJobService
 from app.services.event_archive import EventArchiveService
 from app.services.integration_monitor import IntegrationMonitorService
+from app.services.schema_ownership import SchemaOwnershipService
+from app.services.ingest_manifest import IngestManifestService
+from app.services.pending_revalidation import PendingRevalidationService
 
 SERVICES: dict[str, BaseModuleService] = {
     "api_endpoint": ApiEndpointService(),
@@ -40,6 +43,9 @@ SERVICES: dict[str, BaseModuleService] = {
     "backfill_job": BackfillJobService(),
     "event_archive": EventArchiveService(),
     "integration_monitor": IntegrationMonitorService(),
+    "event_schema_ownership": SchemaOwnershipService(),
+    "ingest_manifest": IngestManifestService(),
+    "pending_revalidation": PendingRevalidationService(),
 }
 
 

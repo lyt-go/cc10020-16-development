@@ -34,7 +34,8 @@ class DataLakeSinkService(BaseModuleService):
         self._write_stats: dict[str, int] = {}
 
     def write_event(self, event_id: str, event_type: str, payload: dict[str, Any],
-                    source_channel_id: int = 0) -> dict[str, Any]:
+                    source_channel_id: int = 0,
+                    attribution: dict[str, Any] | None = None) -> dict[str, Any]:
         """将事件数据写入数据湖。
 
         写入流程：
@@ -48,6 +49,8 @@ class DataLakeSinkService(BaseModuleService):
             event_type: 事件类型
             payload: 事件数据
             source_channel_id: 来源通道ID
+            attribution: 结构归属明细（归属编号、字段指纹、校验结论等），
+                随落湖记录一起写入正式分区，便于回查实际使用的结构
 
         Returns:
             { ok: bool, message: str, partition: str, file_path: str }
@@ -65,6 +68,7 @@ class DataLakeSinkService(BaseModuleService):
             "payload": payload,
             "ingested_at": now.isoformat(),
             "record_hash": hashlib.sha256(json.dumps(payload, sort_keys=True, ensure_ascii=False).encode()).hexdigest()[:16],
+            "attribution": attribution or {},
         }
 
         # 写入分区文件
@@ -160,6 +164,35 @@ class DataLakeSinkService(BaseModuleService):
             "total": len(records),
             "partition": f"events/{event_type}/{date_str}",
         }
+
+    def find_events(self, event_id: str, event_type: str | None = None) -> list[dict[str, Any]]:
+        """在正式分区里按事件标识回查落湖记录（含结构归属）。"""
+        matches: list[dict[str, Any]] = []
+        event_root = os.path.join(self._lake_base, "events")
+        if not os.path.exists(event_root):
+            return matches
+        type_dirs = [event_type] if event_type else [
+            name for name in os.listdir(event_root)
+            if os.path.isdir(os.path.join(event_root, name))
+        ]
+        for type_name in type_dirs:
+            if not type_name:
+                continue
+            root_dir = os.path.join(event_root, type_name)
+            for root, _dirs, files in os.walk(root_dir):
+                for name in sorted(files):
+                    if not name.endswith(".json"):
+                        continue
+                    try:
+                        with open(os.path.join(root, name), "r", encoding="utf-8") as handle:
+                            data = json.load(handle)
+                    except (json.JSONDecodeError, OSError):
+                        continue
+                    records = data if isinstance(data, list) else [data]
+                    for record in records:
+                        if isinstance(record, dict) and str(record.get("event_id")) == str(event_id):
+                            matches.append(record)
+        return matches
 
     def get_lake_stats(self) -> dict[str, Any]:
         """获取数据湖存储统计信息。"""

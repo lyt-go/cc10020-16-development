@@ -53,6 +53,9 @@ npm run dev
 | API端点注册 | `api_endpoint` | 端点配置 | 端点编号、端点名称、请求方法 |
 | Webhook通道 | `webhook_channel` | 通道配置 | 通道编号、通道名称、接收路径 |
 | 事件结构定义 | `event_schema` | 事件结构 | 结构编号、事件类型、字段名称 |
+| 事件结构归属 | `event_schema_ownership` | 结构归属 | 归属编号、结构编号、归属通道 |
+| 接入清单 | `ingest_manifest` | 接入记录 | 清单编号、通道、归属编号 |
+| 待补验记录 | `pending_revalidation` | 待补验记录 | 补验编号、关联清单、缺失字段 |
 | 消息队列消费 | `mq_consumer` | 消费配置 | 配置编号、队列名称、消费组名 |
 | 死信队列管理 | `dlq_handler` | 死信记录 | 记录编号、原始队列、失败原因 |
 | 认证凭证管理 | `api_auth_store` | 认证凭证 | 凭证编号、关联端点、凭证类型 |
@@ -76,6 +79,46 @@ npm run dev
   `frontend/src/domain/<模块>.ts`，用于承载真实业务差异并维持36题位容量。
 - 列表接口统一返回 `{ items, total, page, size }`，动作接口统一返回 `{ ok, message }`。
 - 状态流转只允许在 `app/services` 里改，路由层不做业务判断。
+
+## 事件结构归属与通道校验
+
+事件结构在多个接入通道间发布/共享时，需要一份数据归属凭证来说明
+"这份结构归谁、可以被哪些通道使用"。实现分为三层：
+
+1. **结构归属明细**（`event_schema_ownership`）：登记结构编号、归属通道、
+   发布范围（私有/共享）、授权通道、适用通道版本。发布时把当时的已生效字段
+   固化成字段快照与字段指纹，后续校验、历史回放都以快照为准。
+   - 私有版只对归属通道可用；共享版对授权通道可用。
+   - 未列进共享范围的结构对其他通道只读：`GET /api/event_schema_ownership/{id}/detail?channel_id=N`
+     返回 `可使用=false` 与只读结论。
+   - 发布范围切换走 `授权共享` / `撤销共享` 动作或
+     `POST /api/pipeline/schema-ownership/share`。
+2. **接入校验**（`event_schema.validate_event` → 归属服务）：同一通道可以同时拥有
+   私有版和共享版两套订单结构。解析候选时归属通道的私有版优先，私有版校验不过
+   再尝试已授权的共享版；共享版允许缺省的字段（如币种）会记录默认值口径。
+   一旦使用的共享版对私有版仍有字段缺口，会生成待补验记录。
+   没有共享授权的通道无法指定别的通道的结构放行。
+3. **落点凭证**：每笔接入写一行接入清单（`ingest_manifest`），固化字段快照、
+   事件快照、校验结论、通道版本确认与落湖分区；落湖记录里同时写入
+   `attribution`（归属编号、发布范围、字段指纹、待补验标记）。
+
+回查与重放：
+
+```text
+GET  /api/pipeline/schema-ownership?channel_id=3     # 归属明细（含只读/可用）
+POST /api/pipeline/schema-ownership/publish          # 登记并发布归属
+POST /api/pipeline/schema-ownership/share            # 切换共享授权
+POST /api/pipeline/schema-ownership/confirm-version  # 通道与结构版本确认
+POST /api/pipeline/schema-ownership/intake           # 单笔接入的归属校验
+GET  /api/pipeline/ingest-manifest/{id}/trace        # 沿接入回查结构/落湖/待补验
+GET  /api/pipeline/ingest-manifest/{id}/verify       # 授权切换后核对原校验结果
+POST /api/pipeline/webhook-to-lake?channel_id=3      # 可带 manifest_id/event_id 重投历史订单
+```
+
+兼容口径：事件类型还没有任何"已发布归属"时，校验回落到既有的通道 Schema 逻辑，
+历史数据重放的字段结论保持不变。落湖正式分区位于
+`backend/data_store/lake/events/<事件类型>/<年/月/日>/`，待补验记录位于
+`backend/data_store/pending_revalidation/`。
 
 领域：数据工程
 子方向：数据采集、爬虫与RPA

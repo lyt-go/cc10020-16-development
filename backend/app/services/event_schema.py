@@ -10,10 +10,11 @@ from datetime import datetime, timezone
 from typing import Any
 
 from app.persistence import json_store
-from app.services.base import BaseModuleService
+from app.services.json_module import JsonModuleService
+from app.services.schema_validation import validate_field_snapshot
 
 
-class EventSchemaService(BaseModuleService):
+class EventSchemaService(JsonModuleService):
     MODULE = "event_schema"
     ENTITY = "事件结构"
     OPERATION_TERM = "校验"
@@ -34,6 +35,8 @@ class EventSchemaService(BaseModuleService):
         """对接收的事件Payload执行Schema校验。
 
         校验流程：
+        0. 若该事件类型存在已发布的结构归属明细，改按归属校验（见
+           `validate_by_ownership`），避免通道借道未授权的共享结构；
         1. 查找该通道/事件类型下所有已生效的Schema字段定义
         2. 逐一检查必填字段是否存在、类型是否匹配
         3. 对缺失的必填字段返回具体错误
@@ -46,6 +49,10 @@ class EventSchemaService(BaseModuleService):
         Returns:
             校验结果:{ ok: bool, message: str, missing_fields: list, type_errors: list }
         """
+        ownership_result = self.validate_by_ownership(channel_id, event_type, payload)
+        if ownership_result is not None:
+            return ownership_result
+
         # 查找关联通道的已生效schema字段
         schemas = json_store.get_all(self.MODULE)
         matching = [
@@ -111,6 +118,92 @@ class EventSchemaService(BaseModuleService):
 
         return result
 
+    def validate_by_ownership(self, channel_id: int, event_type: str,
+                              payload: dict[str, Any]) -> dict[str, Any] | None:
+        """按事件结构归属明细校验通道是否有权使用结构。
+
+        返回 None 表示该事件类型尚未发布归属，调用方回落到既有通道 Schema 口径，
+        这样历史数据重放时字段校验结论保持不变。
+        """
+        try:
+            from app.services.schema_ownership import SchemaOwnershipService
+            ownership_svc = SchemaOwnershipService()
+            resolution = ownership_svc.resolve_candidates(channel_id, event_type)
+        except Exception:
+            return None
+
+        if not resolution["published"]:
+            return None
+
+        if resolution["candidates"]:
+            row = resolution["candidates"][0]
+            result = validate_field_snapshot(row.get("字段快照") or [], payload)
+            result.update({
+                "ownership_id": row.get("id"),
+                "归属编号": row.get("归属编号"),
+                "Schema版本": row.get("Schema版本"),
+                "发布范围": row.get("发布范围"),
+                "legacy": False,
+            })
+            return result
+
+        if resolution["version_mismatch"]:
+            blocked = resolution["version_mismatch"][0]
+            message = (
+                f"结构版本确认失败：通道版本 {resolution['channel_version']} 与结构适用版本"
+                f" {blocked.get('适用通道版本')} 不一致"
+            )
+        elif resolution["blocked_shares"]:
+            blocked = resolution["blocked_shares"][0]
+            message = (
+                f"通道 {channel_id} 未获共享授权，不能借用结构 {blocked.get('归属编号')}（归属通道 "
+                f"{blocked.get('归属通道')}）放行"
+            )
+        elif resolution.get("revoked_shares"):
+            revoked = resolution["revoked_shares"][0]
+            message = (
+                f"通道 {channel_id} 的共享授权已撤销：结构 {revoked.get('归属编号')}"
+                f"（归属通道 {revoked.get('归属通道')}）退回私有，不再放行新订单"
+            )
+        elif resolution.get("readonly_others"):
+            readonly = resolution["readonly_others"][0]
+            message = (
+                f"通道 {channel_id} 未获共享授权，结构 {readonly.get('归属编号')}"
+                f"（归属通道 {readonly.get('归属通道')}）只读查看，不能用于放行"
+            )
+        else:
+            message = f"通道 {channel_id} 没有事件类型 {event_type} 的可用结构归属"
+        return {
+            "ok": False,
+            "message": message,
+            "missing_fields": [],
+            "type_errors": [],
+            "checked_fields": 0,
+            "blocked": True,
+            "ownership_id": (
+                resolution["blocked_shares"] or resolution["version_mismatch"]
+                or resolution.get("revoked_shares") or resolution.get("readonly_others") or [{}]
+            )[0].get("id"),
+            "legacy": False,
+        }
+
+    def publish_ownership(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
+        """登记并发布一份事件结构归属明细（委托归属服务）。"""
+        from app.services.schema_ownership import SchemaOwnershipService
+        ownership_svc = SchemaOwnershipService()
+        entry, missing = ownership_svc.create_entry(values)
+        if entry is None:
+            return None, missing
+        published, message = ownership_svc.run_action(int(entry["id"]), "发布归属")
+        if published is None:
+            return None, [message]
+        return published, []
+
+    def ownership_detail(self, channel_id: int | None = None) -> list[dict[str, Any]]:
+        """查看事件结构归属明细；未授权通道看到的是只读视图。"""
+        from app.services.schema_ownership import SchemaOwnershipService
+        return SchemaOwnershipService().list_ownership_detail(channel_id=channel_id)
+
     def create_entry(self, values: dict[str, Any]) -> tuple[dict[str, Any] | None, list[str]]:
         """创建Schema结构定义，附带版本管理和字段去重检查。"""
         missing = [
@@ -120,12 +213,15 @@ class EventSchemaService(BaseModuleService):
         if missing:
             return None, missing
 
-        # 检查是否已存在同事件类型+同字段名称的生效结构
+        # 检查同一结构版本下是否已存在同名生效字段。
+        # 结构编号是结构的身份：同一事件类型可以并存私有版/共享版两套结构，
+        # 只要它们属于不同的结构编号，同名字段是正常的。
         existing = json_store.get_all(self.MODULE)
         duplicate = [
             e for e in existing
             if e.get("事件类型") == values.get("事件类型")
             and e.get("字段名称") == values.get("字段名称")
+            and str(e.get("结构编号", "")) == str(values.get("结构编号", ""))
             and e.get("status") in ("已生效", "待校验")
         ]
         if duplicate:
@@ -226,4 +322,8 @@ class EventSchemaService(BaseModuleService):
             "unique_event_types": len(event_types),
             "required_fields_count": sum(1 for r in rows if str(r.get("必填标识")) in ("是", "true", "True")),
             "operation": self.OPERATION_TERM,
+            "ownership_published": sum(
+                1 for r in json_store.get_all("event_schema_ownership")
+                if r.get("status") == "已发布"
+            ),
         }

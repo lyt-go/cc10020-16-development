@@ -19,6 +19,10 @@ class WebhookPayload(BaseModel):
     data: dict[str, Any] = {}
     headers: dict[str, str] | None = None
     signature: str | None = None
+    # 历史订单重投时可带上原接入清单/原事件标识，用于核对原校验结果。
+    manifest_id: int | None = None
+    event_id: str | None = None
+    preferred_ownership_id: int | None = None
 
 
 class BatchExecuteRequest(BaseModel):
@@ -50,9 +54,10 @@ class ValidationRequest(BaseModel):
 
 @router.post("/webhook-to-lake")
 def pipeline_webhook_to_lake(channel_id: int, payload: WebhookPayload) -> dict[str, Any]:
-    """链路1: Webhook接收 → 事件解析 → 去重 → 分发路由 → 数据落湖。
+    """链路1: Webhook接收 → 结构归属校验 → 去重 → 分发路由 → 数据落湖 → 接入清单。
 
-    完整覆盖：webhook_channel → event_schema → dedup_filter → dispatch_rule → data_lake_sink。
+    完整覆盖：webhook_channel → event_schema_ownership → event_schema
+    → dedup_filter → dispatch_rule → data_lake_sink → ingest_manifest。
     """
     from app.services.webhook_channel import WebhookChannelService
     svc = WebhookChannelService()
@@ -61,6 +66,11 @@ def pipeline_webhook_to_lake(channel_id: int, payload: WebhookPayload) -> dict[s
         payload={"type": payload.event_type, **payload.data},
         signature=payload.signature,
         headers=payload.headers,
+        intake_context={
+            "manifest_id": payload.manifest_id,
+            "event_id": payload.event_id,
+            "preferred_ownership_id": payload.preferred_ownership_id,
+        },
     )
     return result
 
@@ -172,3 +182,108 @@ def pipeline_archive_execute(policy_id: int) -> dict[str, Any]:
     from app.services.event_archive import EventArchiveService
     svc = EventArchiveService()
     return svc.execute_archive(policy_id=policy_id)
+
+
+class OwnershipPublishRequest(BaseModel):
+    ownership: dict[str, Any]
+
+
+class OwnershipShareRequest(BaseModel):
+    ownership_id: int
+    channel_ids: list[str | int] | None = None
+
+
+class OwnershipVersionConfirmRequest(BaseModel):
+    ownership_id: int
+    channel_id: int
+
+
+class OwnershipIntakeRequest(BaseModel):
+    channel_id: int
+    event_type: str
+    data: dict[str, Any]
+    preferred_ownership_id: int | None = None
+
+
+@router.get("/schema-ownership")
+def pipeline_schema_ownership(channel_id: int | None = None,
+                              event_type: str | None = None) -> dict[str, Any]:
+    """链路11: 事件结构归属明细（指定通道时返回只读/可用结论）。"""
+    from app.services.schema_ownership import SchemaOwnershipService
+    svc = SchemaOwnershipService()
+    items = svc.list_ownership_detail(channel_id=channel_id, event_type=event_type)
+    return {"ok": True, "items": items, "total": len(items)}
+
+
+@router.post("/schema-ownership/publish")
+def pipeline_schema_ownership_publish(request: OwnershipPublishRequest) -> dict[str, Any]:
+    """链路11: 结构登记并发布归属（发布时固化字段快照与适用通道版本）。"""
+    from app.services.schema_ownership import SchemaOwnershipService
+    svc = SchemaOwnershipService()
+    entry, missing = svc.create_entry(request.ownership)
+    if entry is None:
+        return {"ok": False, "message": f"归属登记失败：{'、'.join(missing)}", "entry": None}
+    published, message = svc.run_action(int(entry["id"]), "发布归属")
+    return {"ok": published is not None, "message": message, "entry": published}
+
+
+@router.post("/schema-ownership/share")
+def pipeline_schema_ownership_share(request: OwnershipShareRequest) -> dict[str, Any]:
+    """链路11: 共享授权切换（授权通道发生变化后，新接入按新范围校验）。"""
+    from app.services.schema_ownership import SchemaOwnershipService
+    svc = SchemaOwnershipService()
+    entry, message = svc.share_with(request.ownership_id, request.channel_ids)
+    return {"ok": entry is not None, "message": message, "entry": entry}
+
+
+@router.post("/schema-ownership/revoke-share")
+def pipeline_schema_ownership_revoke(ownership_id: int) -> dict[str, Any]:
+    """链路11: 撤销共享授权，结构退回私有只读范围。"""
+    from app.services.schema_ownership import SchemaOwnershipService
+    svc = SchemaOwnershipService()
+    entry, message = svc.revoke_share(ownership_id)
+    return {"ok": entry is not None, "message": message, "entry": entry}
+
+
+@router.post("/schema-ownership/confirm-version")
+def pipeline_schema_ownership_confirm_version(
+        request: OwnershipVersionConfirmRequest) -> dict[str, Any]:
+    """链路11: Webhook通道与结构发布的跨模块版本确认。"""
+    from app.services.schema_ownership import SchemaOwnershipService
+    svc = SchemaOwnershipService()
+    return svc.confirm_channel_version(request.ownership_id, request.channel_id)
+
+
+@router.post("/schema-ownership/intake")
+def pipeline_schema_ownership_intake(request: OwnershipIntakeRequest) -> dict[str, Any]:
+    """链路11: 单笔接入的结构归属校验（结论写入接入清单/待补验记录）。"""
+    from app.services.schema_ownership import SchemaOwnershipService
+    svc = SchemaOwnershipService()
+    return svc.process_intake(
+        request.channel_id,
+        request.event_type,
+        {"type": request.event_type, **request.data},
+        preferred_ownership_id=request.preferred_ownership_id,
+    )
+
+
+@router.get("/ingest-manifest/{manifest_id}/trace")
+def pipeline_ingest_trace(manifest_id: int, event_id: str | None = None) -> dict[str, Any]:
+    """链路12: 沿接入清单回查实际使用的结构、落湖分区与待补验记录。"""
+    from app.services.schema_ownership import SchemaOwnershipService
+    svc = SchemaOwnershipService()
+    trace = svc.trace_intake(manifest_id=manifest_id, event_id=event_id)
+    if trace is None:
+        raise HTTPException(status_code=404, detail=f"接入清单 {manifest_id} 不存在")
+    return {"ok": True, **trace}
+
+
+@router.get("/ingest-manifest/{manifest_id}/verify")
+def pipeline_ingest_verify(manifest_id: int) -> dict[str, Any]:
+    """链路12: 授权切换后核对历史接入的原校验结果。"""
+    from app.services.schema_ownership import SchemaOwnershipService
+    svc = SchemaOwnershipService()
+    result = svc.verify_historical_result(manifest_id)
+    if result is None:
+        raise HTTPException(status_code=404, detail=f"接入清单 {manifest_id} 不存在")
+    return {"ok": True, **result}

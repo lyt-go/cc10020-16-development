@@ -59,3 +59,47 @@ export async function loadOverview(): Promise<OverviewResult> {
   if (!response.ok) throw new Error('运营概览读取失败')
   return await response.json()
 }
+
+export type OwnershipItem = {
+  id: number
+  '归属编号': string
+  '结构编号': string
+  '事件类型': string
+  '归属通道': string
+  '发布范围': string
+  '授权通道': string
+  Schema版本: string
+  '适用通道版本': string
+  可使用: boolean
+  只读: boolean
+  授权结论: string
+  字段快照: { field_name: string; field_type: string; required: boolean; default: unknown }[]
+}
+
+export async function listOwnership(channelId?: string): Promise<OwnershipItem[]> {
+  const query = channelId ? `?channel_id=${encodeURIComponent(channelId)}` : ''
+  const response = await request(`/api/pipeline/schema-ownership${query}`)
+  if (!response.ok) throw new Error('结构归属明细读取失败')
+  const payload = await response.json()
+  return payload.items ?? []
+}
+
+export type IntakeTrace = {
+  manifest: Record<string, unknown>
+  ownership: OwnershipItem | null
+  pending_revalidations: Record<string, unknown>[]
+  lake_records: Record<string, unknown>[]
+  conclusion: Record<string, unknown>
+}
+
+export async function traceIntake(manifestId: number): Promise<IntakeTrace> {
+  const response = await request(`/api/pipeline/ingest-manifest/${manifestId}/trace`)
+  if (!response.ok) throw new Error('接入清单回查失败')
+  return await response.json()
+}
+
+export async function verifyIntake(manifestId: number): Promise<Record<string, unknown>> {
+  const response = await request(`/api/pipeline/ingest-manifest/${manifestId}/verify`)
+  if (!response.ok) throw new Error('历史校验结果核对失败')
+  return await response.json()
+}

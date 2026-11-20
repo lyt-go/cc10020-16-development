@@ -9,10 +9,15 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.config import settings
+from app.demo_seed import load_demo_rows
+from app.persistence import json_store
 from app.routers import ROUTERS
 from app.store import store
 
 app = FastAPI(title="API集成与事件编排平台", version="1.0.0")
+
+# 启动时装载归属/接入清单/待补验的演示数据；分区已有数据时不动。
+load_demo_rows(json_store)
 
 app.add_middleware(
     CORSMiddleware,

@@ -8,6 +8,10 @@ from typing import Any
 
 from app.seed import SEED_ROWS
 
+# 结构归属、接入清单、待补验记录完全落在 JSON 存储里，概览和健康检查
+# 也要把它们算进模块清单，否则看板会漏掉这三块。
+JSON_BACKED_MODULES = ("event_schema_ownership", "ingest_manifest", "pending_revalidation")
+
 
 class Store:
     def __init__(self) -> None:
@@ -16,10 +20,16 @@ class Store:
         }
 
     def module_names(self) -> list[str]:
-        return sorted(self._tables)
+        return sorted({*self._tables, *JSON_BACKED_MODULES})
 
     def rows(self, module: str) -> list[dict[str, Any]]:
+        if module in JSON_BACKED_MODULES:
+            return self._json_rows(module)
         return self._tables.setdefault(module, [])
+
+    def _json_rows(self, module: str) -> list[dict[str, Any]]:
+        from app import persistence
+        return persistence.json_store.get_all(module)
 
     def find(self, module: str, entry_id: int) -> dict[str, Any] | None:
         for row in self.rows(module):
